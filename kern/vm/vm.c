@@ -1,0 +1,282 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <thread.h>
+#include <curthread.h>
+#include <addrspace.h>
+#include <vm.h>
+#include <machine/spl.h>
+#include <machine/tlb.h>
+#include <array.h>
+
+
+/*
+ * Dumb MIPS-only "VM system" that is intended to only be just barely
+ * enough to struggle off the ground. You should replace all of this
+ * code while doing the VM assignment. In fact, starting in that
+ * assignment, this file is not included in your kernel!
+ */
+
+struct frame **coremap;
+int coremapCreated = -1;
+int numCoremapPages;
+int freeCoremapPages;
+
+void initialize_coremap(){
+	u_int32_t startAddr = 0;
+	u_int32_t endAddr = 0;
+
+	ram_getsize(&startAddr, &endAddr);
+	
+	numCoremapPages = (endAddr - startAddr)/PAGE_SIZE;
+	coremap = (struct frame**)kmalloc(sizeof(struct frame*) * numCoremapPages);
+
+	if (coremap == NULL){
+		panic("You fucked up!!!! Couldn't make a coremap, dying now\n");
+	}
+
+	int i = 0;
+	for (i; i < numCoremapPages; i++){
+		struct frame *coreMapEntry = kmalloc(sizeof(struct frame));
+		coreMapEntry->valid = 0;
+		coreMapEntry->chunkSize = 1;
+		coreMapEntry->pid = -1;
+		coreMapEntry->pAddr = startAddr + i * PAGE_SIZE;
+
+		coremap[i] = coreMapEntry;
+	}
+
+	ram_getsize(&startAddr, &endAddr);
+
+	coremapCreated = 0;
+	freeCoremapPages = numCoremapPages;	
+}
+
+/* under dumbvm, always have 48k of user stack */
+#define DUMBVM_STACKPAGES    32
+
+void
+vm_bootstrap(void)
+{
+	/* Do nothing. */
+}
+
+
+paddr_t
+getppages(unsigned long npages)
+{
+	int spl;
+	paddr_t addr;
+
+	spl = splhigh();
+
+	addr = ram_stealmem(npages);
+	
+	splx(spl);
+	return addr;
+}
+
+/* Allocate/free some kernel-space virtual pages */
+vaddr_t 
+alloc_kpages(int npages)
+{
+	paddr_t pa;
+	pa = getppages(npages);
+	if (pa==0) {
+		return 0;
+	}
+	return PADDR_TO_KVADDR(pa);
+}
+
+void 
+free_kpages(vaddr_t addr)
+{
+	int i, j;
+	vaddr_t compare;
+	for (i = 0; i < numCoremapPages; i++){
+		compare = PADDR_TO_KVADDR(coremap[i]->pAddr);
+		if (compare == addr){
+			int size = coremap[i]->chunkSize;
+			for (j = i; j < i + size; j++){
+				coremap[j]->valid = 0;
+				coremap[j]->chunkSize = 1;
+				freeCoremapPages++;
+				// kprintf("Free pages: %d\n", freeCoremapPages);
+			}
+			break;
+		}
+	}
+
+
+
+}
+
+int
+vm_fault(int faulttype, vaddr_t faultaddress)
+{
+	vaddr_t vbase1, vtop1, vbase2, vtop2, stackbase, stacktop, heapbase, heaptop;
+	paddr_t paddr;
+	int i;
+	u_int32_t ehi, elo;
+	struct addrspace *as;
+	int spl;
+
+	spl = splhigh();
+
+	faultaddress &= PAGE_FRAME;
+
+	DEBUG(DB_VM, "dumbvm: fault: 0x%x\n", faultaddress);
+	//kprintf("\n fault type: %d, fault: 0x%x\n", faulttype, faultaddress);
+
+	switch (faulttype) {
+	    case VM_FAULT_READONLY:
+
+
+			/* We always create pages read-write, so we can't get this */
+			panic("dumbvm: got VM_FAULT_READONLY\n");
+	    case VM_FAULT_READ:
+	    case VM_FAULT_WRITE:
+			break;
+	    default:
+		splx(spl);
+		return EINVAL;
+	}
+
+	as = curthread->t_vmspace;
+	if (as == NULL) {
+		/*
+		 * No address space set up. This is probably a kernel
+		 * fault early in boot. Return EFAULT so as to panic
+		 * instead of getting into an infinite faulting loop.
+		 */
+		kprintf("vm_fault 152\n");
+		return EFAULT;
+	}
+
+	/* Assert that the address space has been set up properly. */
+	// assert(as->text.vbase != 0);
+	// assert(as->text.pbase != 0);
+	// assert(as->text.npages != 0);
+	// assert(as->data.vbase != 0);
+	// assert(as->data.pbase != 0);
+	// assert(as->data.npages != 0);
+	//assert(as->stack.pbase != 0);
+	assert((as->text.vbase & PAGE_FRAME) == as->text.vbase);
+	assert((as->text.pbase & PAGE_FRAME) == as->text.pbase);
+	assert((as->data.vbase & PAGE_FRAME) == as->data.vbase);
+	assert((as->data.pbase & PAGE_FRAME) == as->data.pbase);
+	assert((as->stack.pbase & PAGE_FRAME) == as->stack.pbase);
+
+	vbase1 = as->text.vbase;
+	vtop1 = vbase1 + as->text.npages * PAGE_SIZE;
+	vbase2 = as->data.vbase;
+	vtop2 = vbase2 + as->data.npages * PAGE_SIZE;
+	stackbase = as->stack.vbase;
+	stacktop = USERSTACK;
+	heapbase = as->heap.vbase;
+	heaptop = as->heapEnd;
+
+	bool isValid = false;
+	bool inTable = false;
+
+
+	if (faultaddress >= vbase1 && faultaddress < vtop1) {
+		isValid = true;
+	} else if (faultaddress >= vbase2 && faultaddress < vtop2) {
+		isValid = true;
+	} else if (faultaddress >= stackbase && faultaddress < stacktop) {
+		isValid = true;
+
+	} else if(faultaddress < stackbase && faultaddress >= (stackbase-500*PAGE_SIZE) ){
+		as->stack.vbase = faultaddress;
+		isValid = true;
+
+	} else if (faultaddress >= heapbase && faultaddress < heaptop) {
+		isValid = true;
+	}
+
+
+	struct page_entry *entry;
+
+	
+		// If the fault occurs in a valid range, check the page table to see if it exists;
+		if (isValid){
+			for (i=0; i < array_getnum(as->pageTable); i++){
+				entry = (struct page_entry*)array_getguy(as->pageTable, i);
+
+				if (entry->vAddr == faultaddress){
+					if (entry->valid == 0){
+						paddr = getppages(1);
+
+						if (paddr == NULL){
+							return ENOMEM;
+						}
+
+						entry->pAddr = paddr;
+						entry->valid = 1;
+					} else {
+						paddr = entry->pAddr & PAGE_FRAME;
+					}
+					inTable = true;
+					break;
+				}
+			}
+
+		} else {
+			splx(spl);
+			kprintf("vm_fault 227\n");
+			return EFAULT;
+		}
+
+		if(!inTable){
+			struct page_entry* newEntry = kmalloc(sizeof(struct page_entry));
+			newEntry->vAddr = faultaddress;
+			paddr = getppages(1);
+			if (paddr == NULL){
+				return ENOMEM;
+			}
+			newEntry->pAddr = paddr;
+			newEntry->valid = 1;
+			array_add(as->pageTable, newEntry);
+		}
+	
+	
+
+
+	/* make sure it's page-aligned */
+
+	assert((paddr & PAGE_FRAME)==paddr);
+
+	for (i=0; i<NUM_TLB; i++) {
+		TLB_Read(&ehi, &elo, i);
+		if (elo & TLBLO_VALID) {
+			continue;
+		}
+		ehi = faultaddress;
+		elo = paddr | TLBLO_DIRTY | TLBLO_VALID;
+		DEBUG(DB_VM, "dumbvm: 0x%x -> 0x%x\n", faultaddress, paddr);
+		TLB_Write(ehi, elo, i);
+		splx(spl);
+		return 0;
+	}
+
+	kprintf("dumbvm: Ran out of TLB entries - cannot handle page fault\n");
+	splx(spl);
+	kprintf("vm_fault 262\n");
+	return EFAULT;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

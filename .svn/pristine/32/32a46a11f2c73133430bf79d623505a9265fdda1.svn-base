@@ -1,0 +1,649 @@
+#include <types.h>
+#include <kern/errno.h>
+#include <lib.h>
+#include <machine/pcb.h>
+#include <machine/spl.h>
+#include <machine/trapframe.h>
+#include <kern/callno.h>
+#include <syscall.h>
+#include <uio.h>
+#include <thread.h>
+#include <curthread.h>
+#include <vnode.h>
+#include <vfs.h>
+#include <kern/unistd.h>
+#include <synch.h>
+#include <kern/limits.h>
+#include <vm.h>
+#include <addrspace.h>
+
+
+
+/*
+ * System call handler.
+ *
+ * A pointer to the trapframe created during exception entry (in
+ * exception.S) is passed in.
+ *
+ * The calling conventions for syscalls are as follows: Like ordinary
+ * function calls, the first 4 32-bit arguments are passed in the 4
+ * argument registers a0-a3. In addition, the system call number is
+ * passed in the v0 register.
+ *
+ * On successful return, the return value is passed back in the v0
+ * register, like an ordinary function call, and the a3 register is
+ * also set to 0 to indicate success.
+ *
+ * On an error return, the error code is passed back in the v0
+ * register, and the a3 register is set to 1 to indicate failure.
+ * (Userlevel code takes care of storing the error code in errno and
+ * returning the value -1 from the actual userlevel syscall function.
+ * See src/lib/libc/syscalls.S and related files.)
+ *
+ * Upon syscall return the program counter stored in the trapframe
+ * must be incremented by one instruction; otherwise the exception
+ * return code will restart the "syscall" instruction and the system
+ * call will repeat forever.
+ *
+ * Since none of the OS/161 system calls have more than 4 arguments,
+ * there should be no need to fetch additional arguments from the
+ * user-level stack.
+ *
+ * Watch out: if you make system calls that have 64-bit quantities as
+ * arguments, they will get passed in pairs of registers, and not
+ * necessarily in the way you expect. We recommend you don't do it.
+ * (In fact, we recommend you don't use 64-bit quantities at all. See
+ * arch/mips/include/types.h.)
+ */
+
+// turn on DB_SYSCALL flag
+
+
+
+
+void
+mips_syscall(struct trapframe *tf)
+{
+	int callno;
+	int32_t retval;
+	int err;
+
+	assert(curthread != NULL);
+
+
+	callno = tf->tf_v0;
+
+	/*
+	 * Initialize retval to 0. Many of the system calls don't
+	 * really return a value, just 0 for success and -1 on
+	 * error. Since retval is the value returned on success,
+	 * initialize it to 0 by default; thus it's not necessary to
+	 * deal with it except for calls that return other values, 
+	 * like write.
+	 */
+
+	retval = 0;
+
+	switch (callno) {
+	    case SYS_reboot:
+		err = sys_reboot(tf->tf_a0);
+		break;
+		case SYS_write:
+		err = sys_write(tf->tf_a0, (void *) tf->tf_a1, (size_t) tf->tf_a2, &retval);
+		break;
+		case SYS_read:
+		err = sys_read(tf->tf_a0, (void *) tf->tf_a1, (size_t) tf->tf_a2, &retval);
+		break;
+		case SYS_fork:
+			err = sys_fork(tf, &retval);
+		break;
+		case SYS_getpid:
+		retval = sys_getpid();
+		err = 0;
+		break;
+		case SYS_waitpid:
+		err = sys_waitpid(tf->tf_a0, tf->tf_a1, tf->tf_a2, &retval, 0);
+		break;
+		case SYS__exit:
+		sys_exit(tf->tf_a0);
+		break;
+		case SYS_execv:
+		err = sys_execv(tf->tf_a0, tf->tf_a1);
+		break;
+		case SYS___time:
+		err = sys__time(tf->tf_a0, tf->tf_a1, &retval);
+		break;
+		case SYS_sbrk:
+		err = sbrk(tf->tf_a0, &retval);
+		break;
+ 
+	    default:
+		kprintf("Unknown syscall %d\n", callno);
+		err = ENOSYS;
+		break;
+	}
+
+	if (err) {
+		/*
+		 * Return the error code. This gets converted at
+		 * userlevel to a return value of -1 and the error
+		 * code in errno.
+		 */
+		tf->tf_v0 = err;
+		tf->tf_a3 = 1;      /* signal an error */
+	}
+	else {
+		/* Success. */
+		tf->tf_v0 = retval;
+		tf->tf_a3 = 0;      /* signal no error */
+	}
+	
+	/*
+	 * Now, advance the program counter, to avoid restarting
+	 * the syscall over and over again.
+	 */
+	
+	tf->tf_epc += 4;
+	/* Make sure the syscall code didn't forget to lower spl */
+	assert(curspl==0);
+}
+
+void
+md_forkentry(struct trapframe *tf, unsigned long aSpace)
+{
+	/*
+	 * This function is provided as a reminder. You need to write
+	 * both it and the code that calls it.
+	 *
+	 * Thus, you can trash it and do things another way if you prefer.
+	 */
+
+	//create the needed data structs
+	struct addrspace* temp = (struct addrspace*) aSpace;
+	curthread->t_vmspace = temp;
+	as_activate(curthread->t_vmspace);
+
+	struct trapframe tempFrame;
+	struct trapframe* newTrap;
+
+	//define the new trapframe of the new process
+	tempFrame = *tf;
+	newTrap = &tempFrame;
+
+	//define the initial trapframe values of the new thread (ne error) and move forward
+	//the program counter
+	newTrap->tf_v0 = 0;
+	newTrap->tf_a3 = 0;
+	newTrap->tf_epc += 4;
+
+	//send this new thread to the user space with its new trapframe
+	mips_usermode(&tempFrame);
+}
+
+int sys_write(int fd, const void *buf, size_t nbytes, int32_t *returnValue){
+
+	// check that the file desciptor is either STDOUT or STDERR
+	if (fd <= 0 || fd > 2){
+		return EBADF;
+	}
+
+	// allocate space in the kernel
+	char *kbuf = kmalloc(sizeof(char)*nbytes);
+
+	// make sure theres space
+	if (kbuf == NULL){
+		return ENOSPC;
+	}
+
+	// copy from user space to kernel space
+	int copyFail = copyin(buf, kbuf, sizeof(char)*nbytes);
+
+	// check that it copied correctly (ie valid address)
+	if (copyFail){
+		kfree(kbuf);
+		return EFAULT;
+	}
+
+	// for each char we want to write, write it
+	int i;
+	for (i = 0; i < nbytes; i++){
+		putch(kbuf[i]);
+	}
+
+	// return the number of bytes you wrote
+	*returnValue = nbytes;
+
+	// free the allocated space
+	kfree(kbuf);
+
+	// return 0 as the err code, indicating success
+	return 0;
+}
+
+int sys_read(int fd, void *buf, size_t buflen, int32_t *returnValue){
+
+	// make sure that the file is STDIN
+	if (fd != 0){
+		return EBADF;
+	}
+
+	// allocate kernel space
+	char *kbuf = kmalloc(sizeof(char)*buflen);
+
+	int i, ch;
+
+	// create a read lock if it hasn't already been created
+	if (readLock == NULL){
+		readLock = lock_create("readLock");
+	}
+
+	// acquire the lock so that you are the only one to read
+	lock_acquire(readLock);
+
+	// get i characters from the console
+	for (i = 0; i < buflen; i++){
+		ch = getch();
+		kbuf[i] = (char) ch;
+	}
+
+	// release the lock
+	lock_release(readLock);
+
+	// copy from the kernel space to user space
+	int copyFail = copyout(kbuf, buf, buflen);
+
+	// check that copy worked correctly
+	if (copyFail){
+		kfree(kbuf);
+		return EFAULT;
+	}
+
+	// return the buflen
+	*returnValue = buflen;
+
+	kfree(kbuf);
+
+	return 0;
+
+	
+}
+
+pid_t sys_fork(struct trapframe *tf, int* retval){
+
+	//create the needed data structures
+	struct thread* childProcess;
+	struct trapframe* newTrap;
+	struct addrspace* newAddress;
+
+	int check;
+
+	//create a copy of the current memory for the child to use, if this fails then
+	//there is no memory left and we return error
+	check = as_copy(curthread->t_vmspace, &newAddress);
+	if(check != 0 || newAddress == NULL){
+		return ENOMEM;
+	}
+	as_activate(curthread->t_vmspace);
+
+	//create a new trapframe that is a copy of the parents trap frame, if this fails
+	//no memory left and we return error
+	newTrap = (struct trapframe*) kmalloc(sizeof(struct trapframe));
+	if(newTrap == NULL){
+		kfree(newTrap);
+		return ENOMEM;
+	}
+	*newTrap = *tf;
+
+	//thread fork the child in order to make it its own process
+	check = thread_fork("child", newTrap, (unsigned long)newAddress, 
+		(void (*)(void *, unsigned long)) md_forkentry, &childProcess);
+
+	//if we failed to fork for whatever reason (no memory) then return no memory error
+	if(check != 0){
+		kfree(newTrap);
+		return ENOMEM;
+	}
+
+	//define the return value in the actual trapframe
+	tf->tf_v0 = childProcess->pList->pId;
+
+	//return the childs pId
+	*retval = childProcess->pList->pId;
+
+	return 0;
+
+}
+
+//returns the current thread's pId
+pid_t sys_getpid(void){
+
+	return curthread->pId;
+
+}
+
+pid_t sys_waitpid(pid_t pId, int *status, int options, int* retval, int where){
+
+	//if not given the right option then rutern invalid arg
+	if(options != 0)
+		return EINVAL;
+
+	// if given invalid pointer return EFAULT
+	if(status == NULL)
+		return EFAULT;	
+
+	//get the process that has pId = to the the given pId
+	struct processInfo* childProcess = getProcess(pId);
+
+	//if the process doesnt exist then return inval arg
+	if(childProcess == NULL)
+		return EINVAL;
+	
+	if(where == 0){
+
+		int *kbuf = kmalloc(sizeof(int));
+
+
+		int copyFail = copyin(status, kbuf, sizeof(int));
+
+		if (copyFail){
+			kfree(kbuf);
+			return EFAULT;
+		}
+
+		kfree(kbuf);
+	}
+
+	lock_acquire(processInfoLock);
+
+	//set restrictions on who can wait on who, in this case (the simplest one)
+	// only the parent process can wait on the given process
+	if(childProcess->parentPId != curthread->pId || childProcess->waited == WAITED){
+		lock_release(processInfoLock);
+		return EINVAL;
+	}
+
+	//if the process hasnt exited then this should lock up using the CV and shouldnt 
+	//signal until the signal line in thread_exit i.e. only signals when the child has
+	//EXITED and now the wait is over, if it has already then no need to wait simply return
+	if(childProcess->status != EXITED)
+		cv_wait(childProcess->waitPIdCV,processInfoLock);
+	
+	childProcess->waited = WAITED;
+	if(where == 0){
+		copyout((void*)&childProcess->exitCode, status, sizeof(int));//*status = childProcess->exitCode;
+	}
+
+	lock_release(processInfoLock);
+
+	*retval = pId;
+
+	return 0;
+
+}
+
+void sys_exit(int exit_code){
+	
+	struct processInfo* process = curthread->pList;
+
+	process->status = EXITED;
+	process->exitCode = exit_code;
+
+	//if the thread has any exited children then remove them from the list
+	//removeExitedThreads(curthread->pId);
+	
+	//kprintf("removed children\n");
+
+	// get the parent of this process and wake it up 
+	//(regardless if it was sleeping before or not, just in case its waiting on the child)
+	//lock_acquire(processInfoLock);
+	
+
+	thread_exit();
+
+}
+
+
+int sys_execv(const char *program, char **args){
+
+	if (program == NULL || args == NULL){
+		return EFAULT;
+	}
+
+	// Allocate space for the program name using the max possible 
+	// path length defined in limits.h
+	char *kprogram = kmalloc(sizeof(char)*PATH_MAX);
+	size_t nameLength;
+
+	char *kcheck = kmalloc(sizeof(char));
+	int test = copyin(program, kcheck, sizeof(char));
+	if (test){
+		kfree(kcheck);
+		return EFAULT;
+	}
+	test = copyin(args, kcheck, sizeof(char));
+	if (test){
+		kfree(kcheck);
+		return EFAULT;
+	}
+
+
+	// copy the program name from user space to kernel space
+	int result = copyinstr(program, kprogram, PATH_MAX, &nameLength);
+
+	if (result){
+		kfree(kprogram);
+		return EFAULT;
+	}
+
+	if (nameLength <= 1){
+		kfree(kprogram);
+		return EINVAL;
+	}
+
+	// determine how many args there are
+	unsigned long argc = 0;
+	while (args[argc] != NULL){
+		argc++;
+	}
+	// copy the argumenets from user space to kernel space
+	// allocate kernel space for the arguments
+	char **kargs = (char**)kmalloc(sizeof(char*)*argc);
+	
+	size_t argLength;
+
+	// the last argument should be null indicating the end of the args
+	int i = 0;
+	int len = 0;
+	for(i; i < argc; i++){
+
+		test = copyin(args[i], kcheck, sizeof(char));
+		if (test){
+			kfree(kcheck);
+			return EFAULT;
+		}
+
+		// allocate space for the argument and the NULL character 
+		len = strlen(args[i])+1;
+		kargs[i] = kmalloc(sizeof(char)*len);
+
+		result = copyinstr(args[i], kargs[i], len, &argLength);
+		if (result){
+			kfree(kargs[i]);
+			return EFAULT;
+		}
+
+		if (argLength <= 1){
+			kfree(kargs[i]);
+			return EINVAL;
+		}
+		 
+	}
+	
+	kargs[argc] = NULL;
+	
+
+	runprogram(kprogram, kargs, argc);
+
+	return -1;
+}
+
+int sys__time(time_t *secs, unsigned long *nsecs, int32_t *returnValue){
+
+	time_t ksecs;
+	unsigned long knsecs;
+	int err;
+
+	gettime(&ksecs, &knsecs);
+
+	if (secs != NULL){
+		err = copyout(&ksecs, secs, sizeof(time_t));
+		if (err){
+			return err;
+		}
+	}
+
+	if (nsecs != NULL){
+		err = copyout(&knsecs, nsecs, sizeof(unsigned long));
+		if (err){
+			return err;
+		}
+	}
+
+	*returnValue = ksecs;
+
+	return 0;
+	
+}
+
+int sbrk(intptr_t amount, int *returnValue){
+	vaddr_t end, start, stack;
+	
+	end = curthread->t_vmspace->heapEnd;
+	start = curthread->t_vmspace->heap.vbase;
+
+	stack = curthread->t_vmspace->stack.vbase;
+
+	if (amount % 4) {
+		// kprintf("1\n");
+		//return EINVAL;
+		amount = (4 - (amount % 4)) + amount;
+	} 
+
+	if (amount < 0){
+		return EINVAL;
+	}
+
+
+	if (end + (2*amount) > stack){
+		// kprintf("3\n");
+		return ENOMEM;
+	}
+
+	if (end+amount < start){
+		//kprintf("4\n");
+		return EINVAL;
+	} 
+
+
+	*returnValue = end;
+	end = end + amount;
+	curthread->t_vmspace->heapEnd = end;
+
+	return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//essentially removes any children of the given pId that have already exited 
+//from the process list this running data is crucial for exit and waitpid
+void removeExitedThreads(pid_t pId){
+	lock_acquire(processInfoLock);
+	
+	// if the process is empty then we have no threads rto remove and we return
+	if(processListHead == NULL){
+		lock_release(processInfoLock);
+		return;
+	}
+
+	struct processInfo* current = processListHead;
+	struct processInfo* previous = NULL;
+	struct processInfo* temp;
+
+	//loop until end of the List
+	while(current!=NULL){
+
+		//if I am a child of the given pId and i have exited i am to be removed
+		if(current->parentPId == pId && current->status == EXITED){
+			temp = current;
+
+			//if im at the head of my list then my next is the new head and I get deleted
+			if(current == processListHead){
+				current = current->next;
+				processListHead = processListHead->next;
+				cv_destroy(temp->waitPIdCV);
+				kfree(temp);
+			}
+			//if i am not the head then remove me from the list and delete me
+			else{
+				current = current->next;
+				previous->next = current;
+				cv_destroy(temp->waitPIdCV);
+				kfree(temp);
+			}
+			//if i happen to delete the tail i need the tail back so go and get it
+			temp = processListHead;
+			while(temp->next != NULL)
+				temp = temp->next;
+			processListTail = temp;
+		}
+		//if im not NULL then I can move on in the list if not then im leaving the loop anyways
+		if(current != NULL){
+			previous = current;	
+			current = current->next;
+		}
+	}
+	lock_release(processInfoLock);
+}
+
+//loops through the list of processes and returns the processInfo of the process with
+//the given pId if it exists
+struct processInfo* getProcess(pid_t pId){
+	
+	struct processInfo* current = processListHead;
+
+	while(current != NULL){
+		if(current->pId == pId)
+			return current;
+		current = current->next;
+	}
+	return NULL;
+}
